@@ -4,7 +4,8 @@ import type { ChatMessage } from "../ports/language-model.js";
 
 export interface Persona {
   readonly name: string;
-  readonly extraInstructions?: string;
+  /** Free-text personality, e.g. set by the server with /persona. */
+  readonly personality: string | undefined;
 }
 
 export function buildChatMessages(
@@ -14,12 +15,12 @@ export function buildChatMessages(
 ): ChatMessage[] {
   const system = [
     `You are ${persona.name}, a friendly companion hanging out in a Discord voice channel with several people.`,
+    persona.personality ? `Your personality, as set by this server: ${persona.personality}` : "",
     "Everything you write is read aloud by text-to-speech, so reply like you are talking:",
     "one to three short sentences, no markdown, lists, emoji, or links.",
     "User lines are speech-recognition transcripts prefixed with the speaker's name; they may contain recognition errors, so infer what was meant.",
     "Lines not meant for you are context; you can refer to them.",
     `Reply to the latest thing ${addressedBy.displayName} said to you.`,
-    persona.extraInstructions ?? "",
   ]
     .filter(Boolean)
     .join(" ");

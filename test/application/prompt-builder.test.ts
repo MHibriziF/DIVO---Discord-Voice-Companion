@@ -15,7 +15,7 @@ describe("buildChatMessages", () => {
       { kind: "human", speaker: bob, text: "no wait, a comedy", at: 4 },
     ];
 
-    const [system, ...rest] = buildChatMessages({ name: "Divo" }, transcript, bob);
+    const [system, ...rest] = buildChatMessages({ name: "Divo", personality: undefined }, transcript, bob);
 
     expect(system?.role).toBe("system");
     expect(system?.content).toContain("You are Divo");

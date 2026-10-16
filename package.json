@@ -14,7 +14,9 @@
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
     "test": "vitest run",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "doctor": "tsx --env-file-if-exists=.env scripts/doctor.ts",
+    "bench:tts": "tsx scripts/bench-tts.ts"
   },
   "dependencies": {
     "@discordjs/opus": "^0.10.0",

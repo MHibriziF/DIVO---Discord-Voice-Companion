@@ -7,6 +7,8 @@ import {
   VoiceConversation,
 } from "../../src/application/services/voice-conversation.js";
 import type { PcmAudio } from "../../src/domain/audio.js";
+import type { GuildSettings, VoiceGender } from "../../src/domain/guild-settings.js";
+import type { TranscribedSegment } from "../../src/domain/speech-text.js";
 
 const alice = { id: "1", displayName: "Alice" };
 const oneSecond: PcmAudio = { samples: new Int16Array(16_000), sampleRate: 16_000, channels: 1 };
@@ -21,16 +23,22 @@ const silentLogger: Logger = {
 };
 
 const settings: ConversationSettings = {
-  persona: { name: "Divo" },
+  botName: "Divo",
   addressing: { names: ["Divo"], followUpWindowMs: 10_000 },
   transcriptLimits: { maxEntries: 20, maxAgeMs: 600_000 },
   minUtteranceMs: 400,
+  maxNoSpeechProbability: 0.6,
   bargeInAfterMs: 600,
 };
 
-function setup(options: { heard: string[]; reply: string[] }) {
+function setup(options: {
+  heard: (string | TranscribedSegment[])[];
+  reply: string[];
+  guild?: GuildSettings;
+}) {
   let listener: VoiceChannelListener | undefined;
   const played: string[] = [];
+  const voices: VoiceGender[] = [];
   const prompts: ChatMessage[][] = [];
   const heard = [...options.heard];
 
@@ -49,7 +57,12 @@ function setup(options: { heard: string[]; reply: string[] }) {
   const conversation = new VoiceConversation(
     channel,
     {
-      speechToText: { transcribe: async () => heard.shift() ?? "" },
+      speechToText: {
+        transcribe: async () => {
+          const next = heard.shift() ?? [];
+          return typeof next === "string" ? [{ text: next, noSpeechProbability: 0.01 }] : next;
+        },
+      },
       languageModel: {
         async *streamChat(messages) {
           prompts.push([...messages]);
@@ -58,12 +71,16 @@ function setup(options: { heard: string[]; reply: string[] }) {
       },
       // Encode the text into the fake audio so the test can see what was "spoken".
       textToSpeech: {
-        synthesize: async (text) => ({
+        synthesize: async (text, voice) => {
+          voices.push(voice);
+          return {
           samples: new Int16Array(new TextEncoder().encode(text.padEnd(Math.ceil(text.length / 2) * 2)).buffer),
-          sampleRate: 24_000,
-          channels: 1,
-        }),
+            sampleRate: 24_000,
+            channels: 1,
+          };
+        },
       },
+      guildSettings: { get: async () => options.guild ?? { voice: "female", persona: undefined } },
       clock: { now: () => 1_000 },
       logger: silentLogger,
     },
@@ -72,7 +89,7 @@ function setup(options: { heard: string[]; reply: string[] }) {
   conversation.start();
 
   const say = (audio: PcmAudio = oneSecond) => listener!.onUtterance({ speaker: alice, audio, endedAt: 1_000 });
-  return { conversation, channel, say, played, prompts, listener: () => listener! };
+  return { conversation, channel, say, played, voices, prompts, listener: () => listener! };
 }
 
 describe("VoiceConversation", () => {
@@ -117,6 +134,31 @@ describe("VoiceConversation", () => {
 
     await new Promise((resolve) => setTimeout(resolve, 20));
     expect(prompts).toHaveLength(0);
+  });
+
+  it("ignores segments Whisper thinks are not speech", async () => {
+    const { say, prompts } = setup({
+      heard: [[{ text: "Divo, thanks for watching!", noSpeechProbability: 0.9 }]],
+      reply: ["Hello there friend."],
+    });
+
+    say();
+
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(prompts).toHaveLength(0);
+  });
+
+  it("uses the server's chosen voice and persona", async () => {
+    const { say, voices, prompts } = setup({
+      heard: ["Divo, who are you?"],
+      reply: ["Arr, I be Divo the pirate."],
+      guild: { voice: "male", persona: "A grumpy pirate" },
+    });
+
+    say();
+
+    await vi.waitFor(() => expect(voices).toEqual(["male"]));
+    expect(prompts[0]?.[0]?.content).toContain("A grumpy pirate");
   });
 
   it("disconnects from the channel when stopped", () => {
