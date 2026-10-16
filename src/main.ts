@@ -1,4 +1,6 @@
+import { join } from "node:path";
 import Groq from "groq-sdk";
+import { GuildSettingsService } from "./application/services/guild-settings-service.js";
 import type { ConversationServices, ConversationSettings } from "./application/services/voice-conversation.js";
 import { VoiceConversation } from "./application/services/voice-conversation.js";
 import { VoiceSessionManager } from "./application/services/voice-session-manager.js";
@@ -9,13 +11,23 @@ import { GroqLanguageModel } from "./infrastructure/groq/groq-language-model.js"
 import { GroqSpeechToText } from "./infrastructure/groq/groq-speech-to-text.js";
 import { KokoroTextToSpeech } from "./infrastructure/kokoro/kokoro-text-to-speech.js";
 import { createPinoLogger } from "./infrastructure/logging/pino-logger.js";
+import { JsonGuildSettingsRepository } from "./infrastructure/storage/json-guild-settings-repository.js";
 import { createJoinCommand } from "./presentation/discord/commands/join.command.js";
 import { createLeaveCommand } from "./presentation/discord/commands/leave.command.js";
+import { createPersonaCommand } from "./presentation/discord/commands/persona.command.js";
+import { createVoiceCommand } from "./presentation/discord/commands/voice.command.js";
 import { attachDiscordBot } from "./presentation/discord/discord-bot.js";
 
 async function main(): Promise<void> {
   const config = loadConfig(process.env);
   const logger = createPinoLogger(config.logLevel);
+
+  const settingsRepository = new JsonGuildSettingsRepository(join(config.dataDir, "guild-settings.json"));
+  await settingsRepository.load();
+  const guildSettings = new GuildSettingsService(settingsRepository, {
+    voice: config.bot.defaultVoice,
+    persona: config.bot.persona,
+  });
 
   const groq = new Groq({ apiKey: config.groq.apiKey });
   const textToSpeech = new KokoroTextToSpeech(config.kokoro);
@@ -33,15 +45,17 @@ async function main(): Promise<void> {
       reasoningEffort: config.groq.reasoningEffort,
     }),
     textToSpeech,
+    guildSettings,
     clock: { now: () => Date.now() },
     logger,
   };
 
   const settings: ConversationSettings = {
-    persona: { name: config.bot.name, extraInstructions: config.bot.persona },
+    botName: config.bot.name,
     addressing: { names: [config.bot.name, ...config.bot.aliases], followUpWindowMs: config.bot.followUpWindowMs },
     transcriptLimits: { maxEntries: 40, maxAgeMs: 10 * 60_000 },
     minUtteranceMs: 400,
+    maxNoSpeechProbability: config.groq.maxNoSpeechProbability,
     bargeInAfterMs: 600,
   };
 
@@ -62,10 +76,15 @@ async function main(): Promise<void> {
     sessions,
     logger,
     devGuildId: config.discord.devGuildId,
-    commands: [createJoinCommand(sessions, config.bot.name, logger), createLeaveCommand(sessions)],
+    commands: [
+      createJoinCommand(sessions, config.bot.name, logger),
+      createLeaveCommand(sessions),
+      createVoiceCommand(guildSettings, config.bot.name),
+      createPersonaCommand(guildSettings, config.bot.name),
+    ],
   });
 
-  logger.info("Loading text-to-speech model (first run downloads ~90 MB)");
+  logger.info("Loading text-to-speech model (first run downloads ~300 MB)");
   textToSpeech
     .warmUp()
     .then(() => logger.info("Text-to-speech ready"))
