@@ -13,9 +13,11 @@ npm start          # run the compiled bot (reads .env)
 npm test           # unit tests
 npm run lint       # ESLint, including the layer rules below
 npm run typecheck
+npm run doctor     # checks voice deps, Groq key/models, Discord login
+npm run bench:tts  # Kokoro speed on this machine (fp32,q4 by default)
 ```
 
-Setup: copy `.env.example` to `.env` and fill in `DISCORD_TOKEN` and `GROQ_API_KEY`. In the Discord Developer Portal, invite the bot with the `bot` and `applications.commands` scopes and the Connect + Speak permissions. Set `DISCORD_DEV_GUILD_ID` while developing, so slash commands show up immediately.
+Setup, local testing, and server deployment (Docker: `Dockerfile`, `compose.yaml`): see [README.md](README.md).
 
 ## Architecture
 
@@ -47,28 +49,33 @@ src/
   domain/
     audio.ts                 PcmAudio value type
     speaker.ts               Speaker value type
+    guild-settings.ts        Per-server voice (female/male) and persona rules
     addressing-policy.ts     "Was this said to the bot?" (fuzzy name match + follow-up window)
     room-transcript.ts       Rolling log of who said what
     sentence-chunker.ts      Streams LLM tokens into speakable sentences
-    speech-text.ts           Whisper-noise filter, markdown stripping for TTS
+    speech-text.ts           Drops non-speech Whisper segments (no_speech_prob), strips markdown for TTS
   application/
-    ports/                   SpeechToText, LanguageModel, TextToSpeech, VoiceChannel(+Connector), Logger, Clock
+    ports/                   SpeechToText, LanguageModel, TextToSpeech, VoiceChannel(+Connector), GuildSettingsRepository, Logger, Clock
     services/
       voice-conversation.ts  One conversation per voice channel: hear → transcribe → decide → reply → speak
       voice-session-manager.ts  One conversation per guild; join/leave
       prompt-builder.ts      Persona + transcript → chat messages
+      guild-settings-service.ts  /voice and /persona: per-server overrides on top of .env defaults
   infrastructure/
     discord/                 Client, voice connector, DiscordVoiceChannel (Opus receive/decode, playback)
     groq/                    GroqSpeechToText (Whisper), GroqLanguageModel (streaming chat)
     kokoro/                  KokoroTextToSpeech (local ONNX model)
     audio/pcm.ts             Downmix/resample/WAV encoding
+    storage/                 JsonGuildSettingsRepository (data/guild-settings.json, written only on change)
     logging/pino-logger.ts
   presentation/discord/
     discord-bot.ts           Registers slash commands, routes interactions, auto-leaves empty channels
-    commands/                /join, /leave
+    commands/                /join, /leave, /voice, /persona
   config/env.ts
   main.ts
 test/                        Mirrors src/ (domain, application, infrastructure)
+scripts/                     doctor (setup check) and bench-tts (Kokoro speed)
+Dockerfile, compose.yaml     Production image (runs as the `node` user) + volumes for settings and the model cache
 ```
 
 ### Runtime flow
@@ -77,13 +84,14 @@ test/                        Mirrors src/ (domain, application, infrastructure)
 2. `DiscordVoiceChannel` subscribes to each speaking user. Each utterance ends after 800 ms of silence (max 30 s). Opus is decoded to 48 kHz stereo, then converted to 16 kHz mono → `onUtterance`.
 3. `VoiceConversation`:
    - drops clips under 400 ms;
-   - transcribes with Groq Whisper (the bot's name is passed as a vocabulary hint);
-   - filters Whisper's noise phrases ("Thank you.");
+   - transcribes with Groq Whisper (`verbose_json`; the bot's name is passed as a vocabulary hint);
+   - drops segments whose `no_speech_prob` is above `STT_MAX_NO_SPEECH_PROB` (default 0.6), which removes Whisper's invented "Thank you."-style lines from noise;
    - adds the line to the `RoomTranscript`;
    - asks `AddressingPolicy` whether the line was addressed to the bot.
 4. If addressed, the reply is queued (one at a time). The LLM's token stream goes through `SentenceChunker`. Each sentence goes to TTS as soon as it's complete, and plays while the next one is synthesized.
 5. **Barge-in:** if the person being answered talks for > 600 ms while the bot is replying, the reply is aborted. They stay in the follow-up window, so the bot answers what they say next.
-6. The bot leaves when no humans remain in the channel (`discord-bot.ts`). An idle bot makes no API calls.
+6. `/voice` and `/persona` save per-server overrides through `GuildSettingsService`. `VoiceConversation` reads them at the start of each reply, so changes apply mid-conversation. The persona is added to the system prompt; the spoken-style rules still apply.
+7. The bot leaves when no humans remain in the channel (`discord-bot.ts`). An idle bot makes no API calls.
 
 ### Adding or swapping a provider
 
@@ -96,9 +104,10 @@ test/                        Mirrors src/ (domain, application, infrastructure)
 - **DAVE is mandatory** for Discord voice since March 2026. Keep `@snazzah/davey` as a direct dependency and `daveEncryption: true`.
 - **Voice receive is undocumented by Discord** and can break. A known @discordjs/voice issue (discord.js #11419) causes repeated `DecryptionFailed` errors. Recovery is to rejoin.
 - `selfDeaf` must stay `false`, otherwise Discord sends the bot no audio.
-- Kokoro downloads ~90 MB from Hugging Face on first start. Benchmarked on a 20-thread CPU, 3 s of speech took ~0.9 s with `fp32`, ~0.55 s with `q4`, and ~2.7 s with `q8`. Don't use `q8`.
+- Kokoro downloads its model (~300 MB) from Hugging Face on first start, into `node_modules/@huggingface/transformers/.cache` (so `npm ci` wipes it; in Docker that path is a named volume). On a 20-thread laptop CPU, after warm-up, `fp32` and `q4` both ran at ~0.3x real time; `q8` was ~0.9x. Don't use `q8`. Use `npm run bench:tts` to measure a machine.
 - Kokoro's `phonemizer` dependency registers process-wide `unhandledRejection`/`uncaughtException` handlers that rethrow, so **any unhandled promise rejection crashes the bot**. Always attach a `.catch` to promises you don't await.
 - Discord voice audio travels over **UDP**, so the bot must run as a long-lived Node process (PC, VPS). It can't run on Cloudflare Workers or Containers (no outbound UDP), or on any other serverless platform.
+- Guild settings live in one JSON file, kept in memory and written atomically on change. That only works for a single bot process; use a real database before running more than one.
 - Groq reasoning models (`openai/gpt-oss-*`, `qwen/*`) get `reasoning_effort: low` and hidden reasoning by default. Other models must not get those params (config sets `off`).
 
 ## Cost and quotas (Groq free tier)
