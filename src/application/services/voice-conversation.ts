@@ -1,31 +1,35 @@
 import { AddressingPolicy, type AddressingConfig } from "../../domain/addressing-policy.js";
 import { audioDurationMs } from "../../domain/audio.js";
+import type { GuildSettings, VoiceGender } from "../../domain/guild-settings.js";
 import { RoomTranscript, type RoomTranscriptLimits } from "../../domain/room-transcript.js";
 import { SentenceChunker } from "../../domain/sentence-chunker.js";
 import type { Speaker } from "../../domain/speaker.js";
-import { isNoiseTranscript, toSpeakableText } from "../../domain/speech-text.js";
+import { filterSpeech, toSpeakableText } from "../../domain/speech-text.js";
 import type { Clock } from "../ports/clock.js";
 import type { LanguageModel } from "../ports/language-model.js";
 import type { Logger } from "../ports/logger.js";
 import type { SpeechToText } from "../ports/speech-to-text.js";
 import type { TextToSpeech } from "../ports/text-to-speech.js";
 import type { CapturedUtterance, VoiceChannel } from "../ports/voice-channel.js";
-import { buildChatMessages, type Persona } from "./prompt-builder.js";
+import { buildChatMessages } from "./prompt-builder.js";
 
 export interface ConversationServices {
   readonly speechToText: SpeechToText;
   readonly languageModel: LanguageModel;
   readonly textToSpeech: TextToSpeech;
+  readonly guildSettings: { get(guildId: string): Promise<GuildSettings> };
   readonly clock: Clock;
   readonly logger: Logger;
 }
 
 export interface ConversationSettings {
-  readonly persona: Persona;
+  readonly botName: string;
   readonly addressing: AddressingConfig;
   readonly transcriptLimits: RoomTranscriptLimits;
   /** Utterances shorter than this (coughs, clicks) are not transcribed. */
   readonly minUtteranceMs: number;
+  /** Transcribed segments Whisper rates above this no-speech probability are treated as noise. */
+  readonly maxNoSpeechProbability: number;
   /** How long the person being answered must talk over the bot before it stops. */
   readonly bargeInAfterMs: number;
 }
@@ -84,14 +88,16 @@ export class VoiceConversation {
   private async handleUtterance({ speaker, audio, endedAt }: CapturedUtterance): Promise<void> {
     if (this.stopped || audioDurationMs(audio) < this.settings.minUtteranceMs) return;
 
-    let text: string;
+    let segments;
     try {
-      text = (await this.services.speechToText.transcribe(audio)).trim();
+      segments = await this.services.speechToText.transcribe(audio);
     } catch (error) {
       this.logger.warn("Transcription failed", { speaker: speaker.displayName, error });
       return;
     }
-    if (this.stopped || isNoiseTranscript(text)) return;
+    const { text, dropped } = filterSpeech(segments, this.settings.maxNoSpeechProbability);
+    if (dropped.length > 0) this.logger.debug("Dropped non-speech segments", { speaker: speaker.displayName, dropped });
+    if (this.stopped || !text) return;
 
     this.transcript.add({ kind: "human", speaker, text, at: endedAt });
     const reason = this.addressing.evaluate({ speakerId: speaker.id, text, at: endedAt });
@@ -111,13 +117,15 @@ export class VoiceConversation {
     const spoken: string[] = [];
 
     try {
+      // Read per reply so /voice and /persona apply mid-conversation.
+      const { voice, persona } = await this.services.guildSettings.get(this.channel.guildId);
       const messages = buildChatMessages(
-        this.settings.persona,
+        { name: this.settings.botName, personality: persona },
         this.transcript.recent(this.services.clock.now()),
         speaker,
       );
       const tokens = this.services.languageModel.streamChat(messages, abort.signal);
-      await this.speak(toSentences(tokens), abort.signal, spoken);
+      await this.speak(toSentences(tokens), voice, abort.signal, spoken);
     } catch (error) {
       if (!abort.signal.aborted) throw error;
     } finally {
@@ -133,7 +141,12 @@ export class VoiceConversation {
   }
 
   /** Synthesizes each sentence as soon as it arrives, while earlier sentences are still playing. */
-  private async speak(sentences: AsyncIterable<string>, signal: AbortSignal, spoken: string[]): Promise<void> {
+  private async speak(
+    sentences: AsyncIterable<string>,
+    voice: VoiceGender,
+    signal: AbortSignal,
+    spoken: string[],
+  ): Promise<void> {
     let playback = Promise.resolve();
     let failure: unknown;
 
@@ -142,7 +155,7 @@ export class VoiceConversation {
       const text = toSpeakableText(sentence);
       if (!text) continue;
 
-      const audio = this.services.textToSpeech.synthesize(text, signal);
+      const audio = this.services.textToSpeech.synthesize(text, voice, signal);
       audio.catch(() => undefined);
       playback = playback
         .then(async () => {
