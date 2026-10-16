@@ -1,0 +1,17 @@
+services:
+  divo:
+    build: .
+    image: divo
+    container_name: divo
+    restart: unless-stopped
+    init: true
+    env_file: .env
+    volumes:
+      - divo-data:/app/data
+      # Kokoro's ~300 MB model; keeping it in a volume avoids re-downloading on every rebuild.
+      - divo-model-cache:/app/node_modules/@huggingface/transformers/.cache
+    mem_limit: 2g
+
+volumes:
+  divo-data:
+  divo-model-cache:
